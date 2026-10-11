@@ -1,0 +1,36 @@
+# Local packaging scripts and their output
+/deploy/
+
+# Kernel module build products (port/linux-kernel, out-of-tree Kbuild).
+# The core sources in lib/ are compiled in place, so their objects land there.
+*.o
+*.ko
+*.mod
+*.mod.c
+*.a
+*.cmd
+.tmp_versions/
+Module.symvers
+modules.order
+
+# Host build (CMake)
+/build/
+/build-*/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+compile_commands.json
+
+# Python test tools
+__pycache__/
+*.pyc
+
+# Editors and OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
