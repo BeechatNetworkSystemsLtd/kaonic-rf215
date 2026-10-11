@@ -93,6 +93,15 @@
 /** Signal strength value meaning "no valid measurement" (the chip reports 127). */
 #define RF215_RSSI_INVALID ((int8_t)-128)
 
+/** @brief Length of the frame check sequence the baseband appends and checks. */
+#define RF215_FCS_LEN (2u)
+
+/** @brief Unanswered operations in a row before @ref rf215_recovery_needed. */
+#define RF215_FAULT_LIMIT (8u)
+
+/** @brief Least time between two recoveries, microseconds. */
+#define RF215_RECOVER_INTERVAL_US (5000000u)
+
 /** Chip versions, as RF_VN reports them. */
 #define RF215_VN_1 (0x01u)
 #define RF215_VN_3 (0x03u)
@@ -121,6 +130,10 @@ enum rf215_req_kind {
     RF215_REQ_ED,        /**< Measure the energy on the channel. */
     RF215_REQ_RX_READ,   /**< Internal: read a frame the chip has received. */
     RF215_REQ_IQIF,      /**< Apply the I/Q data interface configuration (chip-wide). */
+    RF215_REQ_RECOVER,   /**< Reset a chip that stopped answering and put everything back:
+                              I/Q interface, both configurations, receivers that were on
+                              air. Every running operation is abandoned with
+                              @ref RF215_ERR_ABORTED first. */
 };
 
 /** @brief Modulations the driver can configure. */
@@ -204,10 +217,11 @@ enum rf215_event_kind {
     RF215_EVT_ED_DONE,     /**< An energy measurement completed. */
     RF215_EVT_RX_ARMED,    /**< The receiver is on air. */
     RF215_EVT_RX_STOPPED,  /**< The transceiver is off air. */
-    RF215_EVT_TX_DEFERRED, /**< A frame arrived during listen-before-talk; the transmit
-                                was set aside so it can be read out, and must be
-                                submitted again. The transmit buffer is untouched. */
+    RF215_EVT_TX_DEFERRED, /**< Internal: a frame arrived during listen-before-talk, so the
+                                transmit went back to the queue behind its read-out. Never
+                                reported to the host. */
     RF215_EVT_IQIF_DONE,   /**< The I/Q interface configuration has been applied. */
+    RF215_EVT_RECOVERED,   /**< The chip was reset and everything put back. */
     RF215_EVT_ERROR,       /**< The operation failed; see @ref rf215_event::status. */
 };
 
@@ -217,7 +231,9 @@ struct rf215_event {
     enum rf215_req_kind op;     /**< Operation that produced it. */
     enum rf215_band band;       /**< Transceiver it concerns, where relevant. */
     int status;                 /**< @ref rf215_err, zero unless kind is an error. */
-    uint16_t len;               /**< Bytes received, for @ref RF215_EVT_RX_FRAME. */
+    uint16_t len;               /**< Payload bytes received, for @ref RF215_EVT_RX_FRAME;
+                                     the frame check sequence, when enabled, is not
+                                     counted. */
     int8_t rssi;                /**< dBm, for RX_FRAME and ED_DONE. */
 };
 
@@ -263,6 +279,9 @@ typedef enum rf215_step_result (*rf215_step_fn)(struct rf215_dev* dev,
 struct rf215_op {
     rf215_step_fn next;                 /**< Next step, NULL when idle. */
     enum rf215_req_kind kind;           /**< Operation being performed. */
+    bool recovery_stage;                /**< One stage of the recovery sequence: its event
+                                             advances the sequence instead of reaching the
+                                             host. */
     enum rf215_band band;               /**< Transceiver it applies to. */
     rf215_time_t deadline;              /**< Absolute time the step's own wait expires: a
                                              transition, an interrupt, an answer. */
@@ -332,15 +351,19 @@ struct rf215_trx {
     const struct rf215_band_info* info; /**< Its register bases and tuning offset. */
     struct rf215_radio radio;
     struct rf215_baseband baseband;
-    bool receiving;           /**< The host wants this transceiver on air. */
-    rf215_time_t rearm_after; /**< Earliest a receiver the host wants, but which nothing
-                                   has confirmed on air, is put back. */
-    uint8_t rearm_fails;      /**< Attempts at putting the receiver back since it was
-                                   last confirmed on air. */
-    bool cca_enabled;         /**< Assess the channel before transmitting. */
-    int8_t cca_threshold;     /**< Energy above which the channel counts as busy, dBm. */
-    uint8_t lbt_retries;      /**< Times to retry a busy channel. */
-    uint16_t lbt_backoff_us;  /**< Base wait between retries. */
+    bool enabled;                /**< The board uses this transceiver; see
+                                      @ref rf215_set_band_enabled. */
+    bool receiving;              /**< The host wants this transceiver on air. */
+    struct rf215_phy_config phy; /**< The last configuration applied, for recovery. */
+    bool phy_valid;              /**< One has been applied. */
+    rf215_time_t rearm_after;    /**< Earliest a receiver the host wants, but which nothing
+                                      has confirmed on air, is put back. */
+    uint8_t rearm_fails;         /**< Attempts at putting the receiver back since it was
+                                      last confirmed on air. */
+    bool cca_enabled;            /**< Assess the channel before transmitting. */
+    int8_t cca_threshold;        /**< Energy above which the channel counts as busy, dBm. */
+    uint8_t lbt_retries;         /**< Times to retry a busy channel. */
+    uint16_t lbt_backoff_us;     /**< Base wait between retries. */
 };
 
 /** @name I/Q data interface (serial LVDS to an external baseband)
@@ -380,6 +403,26 @@ struct rf215_iq_status {
  * private to the core except @ref part_number and @ref version, which are
  * valid once @ref RF215_EVT_READY has been reported.
  */
+/** @brief A request accepted while its transceiver was busy, started when it frees. */
+struct rf215_queued_req {
+    bool valid;                  /**< A request is waiting. */
+    struct rf215_req req;        /**< The request; @ref rf215_req::phy points at @ref phy. */
+    struct rf215_phy_config phy; /**< Configuration copied at submit. */
+};
+
+/** @brief A frame waiting to be transmitted; see @ref rf215_tx_queue. */
+struct rf215_queued_tx {
+    const uint8_t* data; /**< Frame, NULL when none is waiting. */
+    uint16_t len;        /**< Its length. */
+};
+
+/** @brief Where the recovery sequence is. */
+struct rf215_recovery {
+    bool active;          /**< A recovery is running; no transmit starts meanwhile. */
+    uint8_t stage;        /**< Which stage (RESET, IQIF, CONFIGURE x2) is in flight. */
+    enum rf215_band band; /**< Transceiver the request was submitted on. */
+};
+
 struct rf215_dev {
     enum rf215_pn part_number; /**< Identified part, valid after reset. */
     uint8_t version;           /**< Chip version, valid after reset. */
@@ -412,6 +455,18 @@ struct rf215_dev {
     uint8_t irq_empty;
     /** @private The chip reported a wake-up nobody asked for. */
     bool chip_reset;
+    /** @private Operations the chip did not answer in a row. */
+    uint8_t faults;
+    /** @private Enough faults have built up for a recovery. */
+    bool recovery_due;
+    /** @private Earliest the next recovery may be asked for. */
+    rf215_time_t recovery_allowed_at;
+    /** @private One request per transceiver, waiting for the slot. */
+    struct rf215_queued_req queue[RF215_TRX_COUNT];
+    /** @private One frame per transceiver, waiting for the slot. */
+    struct rf215_queued_tx tx[RF215_TRX_COUNT];
+    /** @private */
+    struct rf215_recovery recovery;
     /** @private RF_CFG.DRV, the digital pad drive strength. */
     uint8_t pad_drive;
     /** @private I/Q interface configuration, applied by RF215_REQ_IQIF. */
@@ -442,8 +497,14 @@ int rf215_init(struct rf215_dev* dev, const struct rf215_port* port);
  * @param dev  Device.
  * @param req  Operation to perform.
  *
- * @return @ref RF215_OK, @ref RF215_ERR_BUSY if one is already in progress, or
- *         @ref RF215_ERR_INVAL for an unknown request.
+ * A request for a busy transceiver is queued and started as soon as the slot
+ * frees, ahead of any transmit waiting there; one request may wait per
+ * transceiver. The configuration a CONFIGURE request points at is copied at
+ * submit.
+ *
+ * @return @ref RF215_OK once accepted or queued, @ref RF215_ERR_BUSY if a request
+ *         is already waiting, or @ref RF215_ERR_INVAL for an unknown request or
+ *         a transceiver that is not enabled.
  */
 int rf215_submit(struct rf215_dev* dev, const struct rf215_req* req);
 
@@ -542,6 +603,17 @@ void rf215_set_rx_buffer(struct rf215_dev* dev, enum rf215_band band, uint8_t* b
 void rf215_abort(struct rf215_dev* dev, enum rf215_band band);
 
 /**
+ * @brief Abandon an operation the chip never answered.
+ *
+ * As @ref rf215_abort, and counts towards @ref rf215_recovery_needed: enough
+ * of these in a row mean the chip is gone, not just slow.
+ *
+ * @param dev   Device.
+ * @param band  Transceiver to release.
+ */
+void rf215_abort_unanswered(struct rf215_dev* dev, enum rf215_band band);
+
+/**
  * @brief Set the drive strength of the chip's digital output pads.
  *
  * RF_CFG.DRV: 0 = 2 mA, 1 = 4 mA, 2 = 6 mA, 3 = 8 mA. It governs how hard the
@@ -556,6 +628,33 @@ void rf215_abort(struct rf215_dev* dev, enum rf215_band band);
  * @param drive  Field value, clamped to 0..3.
  */
 void rf215_set_pad_drive(struct rf215_dev* dev, uint8_t drive);
+
+/**
+ * @brief Say whether the board uses a transceiver.
+ *
+ * Both are enabled after @ref rf215_init. A transceiver that is not enabled
+ * accepts no request and no frame, its interrupts stay masked at the chip and
+ * whatever its status registers report is ignored; the chip-wide requests
+ * (@ref RF215_REQ_RESET, @ref RF215_REQ_IQIF, @ref RF215_REQ_RECOVER) go to
+ * the other one.
+ *
+ * The masks are written by the reset, so set it before submitting one.
+ *
+ * @param dev      Device.
+ * @param band     Transceiver.
+ * @param enabled  Whether it is used.
+ */
+void rf215_set_band_enabled(struct rf215_dev* dev, enum rf215_band band, bool enabled);
+
+/**
+ * @brief Whether a transceiver is enabled; see @ref rf215_set_band_enabled.
+ *
+ * @param dev   Device.
+ * @param band  Transceiver to ask about.
+ *
+ * @return True if it is, false if not or for an unknown band.
+ */
+bool rf215_band_enabled(const struct rf215_dev* dev, enum rf215_band band);
 
 /**
  * @brief Choose the I/Q data interface settings for the next
@@ -623,18 +722,80 @@ bool rf215_transmitting(const struct rf215_dev* dev, enum rf215_band band);
 bool rf215_irq_unserviced(const struct rf215_dev* dev);
 
 /**
- * @brief Whether the chip reset itself since this was last asked.
+ * @brief Whether the chip needs a @ref RF215_REQ_RECOVER.
  *
- * A wake-up outside a reset operation means the chip lost its supply or was
- * reset behind the driver's back: every register is at its default and it
- * will raise no further interrupt. The host should reset and configure again.
- * Reading the flag clears it.
+ * True when the chip reset itself (a wake-up outside a reset operation: every
+ * register is at its default and it will raise no further interrupt), or when
+ * @ref RF215_FAULT_LIMIT operations in a row went unanswered. Asked for at most
+ * once per @ref RF215_RECOVER_INTERVAL_US; the answer clears the condition.
  *
  * @param dev  Device.
  *
- * @return True once for each unexpected chip reset seen.
+ * @return True once per recovery the host should run.
  */
-bool rf215_take_chip_reset(struct rf215_dev* dev);
+bool rf215_recovery_needed(struct rf215_dev* dev);
+
+/**
+ * @brief Queue one frame for transmission.
+ *
+ * The frame is transmitted as soon as the transceiver's slot is free and no
+ * request is waiting for it, and reported like a submitted
+ * @ref RF215_REQ_TX. The buffer must stay valid until @ref RF215_EVT_TX_DONE,
+ * @ref RF215_EVT_TX_BUSY or an error is reported, or @ref rf215_tx_cancel
+ * returns true.
+ *
+ * @param dev   Device.
+ * @param band  Transceiver to send on.
+ * @param data  Frame, without a frame check sequence.
+ * @param len   Length in bytes, 1 to @ref RF215_FRAME_MAX less the FCS.
+ *
+ * @return @ref RF215_OK, @ref RF215_ERR_BUSY if a frame is already waiting, or
+ *         @ref RF215_ERR_INVAL for an empty frame or a transceiver that is not
+ *         enabled.
+ */
+int rf215_tx_queue(struct rf215_dev* dev, enum rf215_band band, const uint8_t* data, uint16_t len);
+
+/**
+ * @brief Take back a frame that has not started transmitting.
+ *
+ * @param dev   Device.
+ * @param band  Transceiver it was queued on.
+ *
+ * @return True if a frame was waiting and is now the caller's again; false if
+ *         none was, or it is already in flight (see @ref rf215_transmitting).
+ */
+bool rf215_tx_cancel(struct rf215_dev* dev, enum rf215_band band);
+
+/**
+ * @brief The settings a transceiver starts with.
+ *
+ * MR-OFDM option 1, MCS 6, on the band's default frequency, channel 5 of
+ * 200 kHz, +6 dB transmit power setting, no frame check sequence. The board
+ * properties (external LNA bypass, AGC gain map) are left at zero.
+ *
+ * @param phy   Filled in.
+ * @param band  Which band's frequency to use.
+ */
+void rf215_phy_config_default(struct rf215_phy_config* phy, enum rf215_band band);
+
+/**
+ * @brief The I/Q interface settings the chip resets to: interface off, 2 mA,
+ *        200 mV common mode, 3.9 ns skew.
+ *
+ * @param iq  Filled in.
+ */
+void rf215_iq_config_default(struct rf215_iq_config* iq);
+
+/**
+ * @brief Map a signal strength onto the 0..255 link quality scale of IEEE
+ *        802.15.4.
+ *
+ * @param rssi  dBm, or @ref RF215_RSSI_INVALID.
+ *
+ * @return 0 at -100 dBm or below and for an invalid value, 255 at 0 dBm or
+ *         above, linear between.
+ */
+uint8_t rf215_lqi(int8_t rssi);
 
 /**
  * @brief Interface status read back by the last @ref RF215_REQ_IQIF.

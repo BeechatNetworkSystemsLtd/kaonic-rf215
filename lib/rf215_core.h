@@ -49,6 +49,16 @@
 #define RF215_STATE_TIMEOUT_US (20000u)
 #define RF215_STATE_ATTEMPTS (3u)
 
+/* What rf215_phy_config_default() fills in: the settings the userspace driver
+ * starts its first module with. TXPWR 6 is about -11 dBm at the chip. */
+#define RF215_DEFAULT_FREQ_09_HZ (869535000u)
+#define RF215_DEFAULT_FREQ_24_HZ (2450000000u)
+#define RF215_DEFAULT_CHANNEL_SPACING_HZ (200000u)
+#define RF215_DEFAULT_CHANNEL (5u)
+#define RF215_DEFAULT_OFDM_MCS (6u)
+#define RF215_DEFAULT_TX_POWER (6u)
+#define RF215_DEFAULT_AGC_TARGET (3u)
+
 /*
  * Interval at which the engine re-arms a receiver the host wants on air but
  * nothing has confirmed there. The chip raises no interrupt when it drops out

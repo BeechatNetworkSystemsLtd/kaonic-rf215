@@ -1,0 +1,22 @@
+# SPDX-License-Identifier: GPL-2.0
+
+obj-m += kaonic_rf215.o
+
+kaonic_rf215-y := rf215_bind.o \
+	   rf215_port.o \
+	   rf215_netdev.o \
+	   rf215_mac802154.o \
+	   rf215_sysfs.o \
+	   rf215_debugfs.o \
+	   ../../lib/rf215_dev.o \
+	   ../../lib/op/op_reset.o \
+	   ../../lib/op/op_configure.o \
+	   ../../lib/phy/rf215_phy_ofdm.o \
+	   ../../lib/phy/rf215_phy_qpsk.o \
+	   ../../lib/phy/rf215_phy_fsk.o \
+	   ../../lib/op/op_tx.o \
+	   ../../lib/op/op_rx.o \
+	   ../../lib/op/op_iqif.o \
+	   ../../lib/rf215_band.o
+
+ccflags-y := -I$(src)/../../include -I$(src)/../../lib -I$(src)/../../lib/op

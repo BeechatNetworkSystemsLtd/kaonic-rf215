@@ -51,6 +51,7 @@ enum rf215_err {
     RF215_ERR_INVAL = -22,    /**< Invalid argument (-EINVAL). */
     RF215_ERR_BUSY = -16,     /**< Operation already in progress (-EBUSY). */
     RF215_ERR_TIMEOUT = -110, /**< Chip did not answer in time (-ETIMEDOUT). */
+    RF215_ERR_ABORTED = -125, /**< Abandoned for a recovery (-ECANCELED). */
 };
 
 /** @brief Severity of a message passed to @ref rf215_port::log. */

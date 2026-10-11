@@ -20,10 +20,33 @@
 
 #define IRQS_COUNT (4u)
 
+/* Stages of the recovery sequence, in order. */
+#define RECOVERY_STAGE_IDLE (0u)
+#define RECOVERY_STAGE_RESET (1u)
+#define RECOVERY_STAGE_IQIF (2u)
+#define RECOVERY_STAGE_CFG_09 (3u)
+#define RECOVERY_STAGE_CFG_24 (4u)
+
 /******************************************************************************/
 /** Forward Declarations ******************************************************/
 
 static void init_trx(struct rf215_trx* trx, enum rf215_band band);
+/* Starts a request in a free slot; the caller has checked it is free. */
+static void start_request(struct rf215_dev* dev, const struct rf215_req* req, bool recovery_stage);
+/* Starts the queued request or frame, if the slot is free and one is waiting. */
+static bool start_waiting_work(struct rf215_dev* dev, uint8_t index);
+/* Abandons an operation and stages RF215_ERR_ABORTED for whoever waits on it. */
+static void abort_and_report(struct rf215_dev* dev, uint8_t index);
+/* Begins the recovery sequence; see rf215_submit. */
+static int start_recovery(struct rf215_dev* dev, enum rf215_band band);
+/* Submits the recovery stage that follows the one that just completed. */
+static void recovery_next_stage(struct rf215_dev* dev);
+/* Ends the recovery sequence, with an event for the host. */
+static void recovery_end(struct rf215_dev* dev, int status, struct rf215_event* out_evt);
+/* Counts an unanswered operation; enough in a row ask for a recovery. */
+static void count_fault(struct rf215_dev* dev);
+/* Keeps the fault count and the last applied configuration up to date. */
+static void track_event(struct rf215_dev* dev, const struct rf215_op* op);
 /* Starts the read-out of a frame the chip holds, if the slot is free. */
 static bool start_pending_receive(struct rf215_dev* dev, uint8_t index);
 /* Puts back a receiver the host wants that nothing has confirmed on air.
@@ -79,56 +102,72 @@ int rf215_submit(struct rf215_dev* dev, const struct rf215_req* req) {
         return RF215_ERR_INVAL;
     }
 
-    if ((unsigned)req->band >= RF215_TRX_COUNT) {
+    if (!rf215_band_enabled(dev, req->band)) {
         return RF215_ERR_INVAL;
     }
 
-    struct rf215_op* op = &dev->op[req->band];
-
-    if (op->next != NULL) {
-        return RF215_ERR_BUSY;
-    }
-
-    const struct rf215_op empty = { 0 };
-    *op = empty;
-    op->kind = req->kind;
-    op->band = req->band;
-
-    if (req->phy != NULL) {
-        op->phy_copy = *req->phy;
-        op->phy = &op->phy_copy;
-    }
-
-    op->tx_data = req->tx_data;
-    op->len = req->tx_len;
-
     switch (req->kind) {
         case RF215_REQ_RESET:
-            op->next = rf215_op_reset_start;
-            break;
         case RF215_REQ_CONFIGURE:
-            op->next = rf215_op_configure_start;
-            break;
         case RF215_REQ_TX:
-            op->next = rf215_op_tx_start;
-            break;
         case RF215_REQ_RX_START:
-            op->next = rf215_op_rx_start;
-            break;
         case RF215_REQ_RX_STOP:
-            op->next = rf215_op_rx_stop;
-            break;
         case RF215_REQ_ED:
-            op->next = rf215_op_ed_start;
-            break;
         case RF215_REQ_IQIF:
-            op->next = rf215_op_iqif_start;
             break;
+        case RF215_REQ_RECOVER:
+            return start_recovery(dev, req->band);
         default:
             return RF215_ERR_INVAL;
     }
 
+    if (dev->op[req->band].next == NULL) {
+        start_request(dev, req, false);
+        return RF215_OK;
+    }
+
+    struct rf215_queued_req* queued = &dev->queue[req->band];
+
+    if (queued->valid) {
+        return RF215_ERR_BUSY;
+    }
+
+    queued->req = *req;
+
+    if (req->phy != NULL) {
+        queued->phy = *req->phy;
+        queued->req.phy = &queued->phy;
+    }
+
+    queued->valid = true;
+
     return RF215_OK;
+}
+
+int rf215_tx_queue(struct rf215_dev* dev, enum rf215_band band, const uint8_t* data, uint16_t len) {
+    if (!rf215_band_enabled(dev, band) || (data == NULL) || (len == 0u)) {
+        return RF215_ERR_INVAL;
+    }
+
+    if (dev->tx[band].data != NULL) {
+        return RF215_ERR_BUSY;
+    }
+
+    dev->tx[band].data = data;
+    dev->tx[band].len = len;
+
+    return RF215_OK;
+}
+
+bool rf215_tx_cancel(struct rf215_dev* dev, enum rf215_band band) {
+    if ((dev == NULL) || ((unsigned)band >= RF215_TRX_COUNT) || (dev->tx[band].data == NULL)) {
+        return false;
+    }
+
+    dev->tx[band].data = NULL;
+    dev->tx[band].len = 0u;
+
+    return true;
 }
 
 void rf215_set_cca(struct rf215_dev* dev,
@@ -162,6 +201,16 @@ void rf215_set_pad_drive(struct rf215_dev* dev, uint8_t drive) {
     }
 }
 
+void rf215_set_band_enabled(struct rf215_dev* dev, enum rf215_band band, bool enabled) {
+    if ((dev != NULL) && ((unsigned)band < RF215_TRX_COUNT)) {
+        dev->trx[band].enabled = enabled;
+    }
+}
+
+bool rf215_band_enabled(const struct rf215_dev* dev, enum rf215_band band) {
+    return (dev != NULL) && ((unsigned)band < RF215_TRX_COUNT) && dev->trx[band].enabled;
+}
+
 void rf215_set_iq_config(struct rf215_dev* dev, const struct rf215_iq_config* iq) {
     if ((dev != NULL) && (iq != NULL)) {
         dev->iq = *iq;
@@ -190,14 +239,82 @@ bool rf215_irq_unserviced(const struct rf215_dev* dev) {
     return (dev != NULL) && ((dev->irq_raised != 0u) || (dev->irq_empty >= RF215_IRQ_EMPTY_MAX));
 }
 
-bool rf215_take_chip_reset(struct rf215_dev* dev) {
-    if ((dev == NULL) || !dev->chip_reset) {
+bool rf215_recovery_needed(struct rf215_dev* dev) {
+    if ((dev == NULL) || !(dev->chip_reset || dev->recovery_due)) {
         return false;
     }
 
-    dev->chip_reset = false;
+    /* Too soon after the last one: the condition is dropped, not deferred, so
+     * a chip that keeps failing is not reset over and over. */
+    const rf215_time_t now = dev->port.now(dev->port.ctx);
+    const bool due = now >= dev->recovery_allowed_at;
 
-    return true;
+    dev->chip_reset = false;
+    dev->recovery_due = false;
+
+    if (due) {
+        dev->recovery_allowed_at = now + RF215_RECOVER_INTERVAL_US;
+    }
+
+    return due;
+}
+
+void rf215_phy_config_default(struct rf215_phy_config* phy, enum rf215_band band) {
+    if (phy == NULL) {
+        return;
+    }
+
+    const struct rf215_phy_config empty = { 0 };
+    *phy = empty;
+
+    phy->modulation = RF215_MOD_OFDM;
+    phy->freq_hz = (band == RF215_BAND_24) ? RF215_DEFAULT_FREQ_24_HZ : RF215_DEFAULT_FREQ_09_HZ;
+    phy->channel_spacing_hz = RF215_DEFAULT_CHANNEL_SPACING_HZ;
+    phy->channel = RF215_DEFAULT_CHANNEL;
+    phy->ofdm.opt = 0u; /* bandwidth option 1 */
+    phy->ofdm.mcs = RF215_DEFAULT_OFDM_MCS;
+    phy->qpsk.fchip = 0u; /* 100 kchip/s */
+    phy->qpsk.mode = 0u;
+    /* IEEE 802.15.4g common sub-GHz MR-FSK mode: 2-FSK, 200 ksym/s, modulation
+     * index 1, BT 0.5, whitened, 8 octet preamble. */
+    phy->fsk.srate = 3u;
+    phy->fsk.midx = 3u;
+    phy->fsk.mord = 0u;
+    phy->fsk.bt = 0u;
+    phy->fsk.fec = false;
+    phy->fsk.dw = true;
+    phy->fsk.preamble = 8u;
+    phy->tx_power = RF215_DEFAULT_TX_POWER;
+    phy->fcs = false;
+    phy->agc_target = RF215_DEFAULT_AGC_TARGET;
+    phy->edd_us = 0u;
+}
+
+void rf215_iq_config_default(struct rf215_iq_config* iq) {
+    if (iq == NULL) {
+        return;
+    }
+
+    const struct rf215_iq_config reset_values = {
+        .chip_mode = RF215_CHIP_MODE_BBRF,
+        .drive_ma = 1u,
+        .common_mode = 1u,
+        .skew = 2u,
+    };
+
+    *iq = reset_values;
+}
+
+uint8_t rf215_lqi(int8_t rssi) {
+    if ((rssi == RF215_RSSI_INVALID) || (rssi <= -100)) {
+        return 0u;
+    }
+
+    if (rssi >= 0) {
+        return 255u;
+    }
+
+    return (uint8_t)(((rssi + 100) * 255) / 100);
 }
 
 void rf215_abort(struct rf215_dev* dev, enum rf215_band band) {
@@ -229,6 +346,15 @@ void rf215_abort(struct rf215_dev* dev, enum rf215_band band) {
     if ((dev->xfer_owner == RF215_XFER_OWNER_OP) && (dev->active == (uint8_t)band)) {
         dev->xfer_owner = RF215_XFER_OWNER_NONE;
     }
+}
+
+void rf215_abort_unanswered(struct rf215_dev* dev, enum rf215_band band) {
+    if ((dev == NULL) || ((unsigned)band >= RF215_TRX_COUNT) || (dev->op[band].next == NULL)) {
+        return;
+    }
+
+    rf215_abort(dev, band);
+    count_fault(dev);
 }
 
 enum rf215_step_result rf215_step(struct rf215_dev* dev,
@@ -418,12 +544,239 @@ const struct rf215_stats* rf215_stats(const struct rf215_dev* dev) {
 static void init_trx(struct rf215_trx* trx, enum rf215_band band) {
     trx->band = band;
     trx->info = rf215_band_info(band);
+    trx->enabled = true;
     trx->radio.irqs = 0u;
     trx->baseband.irqs = 0u;
     trx->cca_enabled = RF215_CCA_DEFAULT_ENABLED;
     trx->cca_threshold = RF215_CCA_DEFAULT_THRESHOLD_DBM;
     trx->lbt_retries = RF215_CCA_DEFAULT_RETRIES;
     trx->lbt_backoff_us = RF215_CCA_DEFAULT_BACKOFF_US;
+}
+
+static void start_request(struct rf215_dev* dev, const struct rf215_req* req, bool recovery_stage) {
+    struct rf215_op* op = &dev->op[req->band];
+    const struct rf215_op empty = { 0 };
+
+    *op = empty;
+    op->kind = req->kind;
+    op->band = req->band;
+    op->recovery_stage = recovery_stage;
+
+    if (req->phy != NULL) {
+        op->phy_copy = *req->phy;
+        op->phy = &op->phy_copy;
+    }
+
+    op->tx_data = req->tx_data;
+    op->len = req->tx_len;
+
+    switch (req->kind) {
+        case RF215_REQ_RESET:
+            op->next = rf215_op_reset_start;
+            break;
+        case RF215_REQ_CONFIGURE:
+            op->next = rf215_op_configure_start;
+            break;
+        case RF215_REQ_TX:
+            op->next = rf215_op_tx_start;
+            break;
+        case RF215_REQ_RX_START:
+            op->next = rf215_op_rx_start;
+            break;
+        case RF215_REQ_RX_STOP:
+            op->next = rf215_op_rx_stop;
+            break;
+        case RF215_REQ_ED:
+            op->next = rf215_op_ed_start;
+            break;
+        case RF215_REQ_IQIF:
+        default:
+            op->next = rf215_op_iqif_start;
+            break;
+    }
+}
+
+/* A waiting request goes before a waiting frame, so a settings change or a
+ * receive start gets in under a standing transmit load; nothing starts while a
+ * recovery runs, except the recovery's own stages. */
+static bool start_waiting_work(struct rf215_dev* dev, uint8_t index) {
+    if (dev->recovery.active) {
+        if ((dev->recovery.stage == RECOVERY_STAGE_IDLE)
+            && (index == (uint8_t)dev->recovery.band)) {
+            recovery_next_stage(dev);
+            return dev->op[index].next != NULL;
+        }
+
+        return false;
+    }
+
+    struct rf215_queued_req* queued = &dev->queue[index];
+
+    if (queued->valid) {
+        queued->valid = false;
+        start_request(dev, &queued->req, false);
+        return true;
+    }
+
+    struct rf215_queued_tx* tx = &dev->tx[index];
+
+    if (tx->data != NULL) {
+        const struct rf215_req req = {
+            .kind = RF215_REQ_TX,
+            .band = (enum rf215_band)index,
+            .tx_data = tx->data,
+            .tx_len = tx->len,
+        };
+
+        tx->data = NULL;
+        tx->len = 0u;
+        start_request(dev, &req, false);
+        return true;
+    }
+
+    return false;
+}
+
+static void abort_and_report(struct rf215_dev* dev, uint8_t index) {
+    struct rf215_op* op = &dev->op[index];
+
+    if (op->next == NULL) {
+        return;
+    }
+
+    const enum rf215_req_kind kind = op->kind;
+
+    rf215_abort(dev, (enum rf215_band)index);
+
+    /* The engine's own read-out has nobody waiting on it. */
+    if (kind == RF215_REQ_RX_READ) {
+        return;
+    }
+
+    op->kind = kind;
+    op->evt.kind = RF215_EVT_ERROR;
+    op->evt.op = kind;
+    op->evt.band = (enum rf215_band)index;
+    op->evt.status = RF215_ERR_ABORTED;
+    op->next = step_report;
+}
+
+/*
+ * Every running operation is abandoned with an event, so its waiter is released.
+ * The reset itself waits until the slot it runs in has reported that event: the
+ * sequence starts from step_one() once the slot is free. Receivers that were on
+ * air are put back by the configure stages and the engine's own re-arm.
+ */
+static int start_recovery(struct rf215_dev* dev, enum rf215_band band) {
+    if (dev->recovery.active) {
+        return RF215_ERR_BUSY;
+    }
+
+    for (uint8_t i = 0u; i < RF215_TRX_COUNT; ++i) {
+        abort_and_report(dev, i);
+        /* A frame still waiting is the host's to cancel; see rf215_tx_cancel. */
+    }
+
+    dev->recovery.active = true;
+    dev->recovery.stage = RECOVERY_STAGE_IDLE;
+    dev->recovery.band = band;
+
+    return RF215_OK;
+}
+
+static void recovery_next_stage(struct rf215_dev* dev) {
+    struct rf215_recovery* rec = &dev->recovery;
+    struct rf215_req req = {
+        .band = rec->band,
+    };
+
+    for (;;) {
+        rec->stage++;
+
+        switch (rec->stage) {
+            case RECOVERY_STAGE_RESET:
+                req.kind = RF215_REQ_RESET;
+                break;
+            case RECOVERY_STAGE_IQIF:
+                req.kind = RF215_REQ_IQIF;
+                break;
+            case RECOVERY_STAGE_CFG_09:
+            case RECOVERY_STAGE_CFG_24: {
+                const uint8_t i = (rec->stage == RECOVERY_STAGE_CFG_09) ? 0u : 1u;
+
+                /* A transceiver never configured is left alone. */
+                if (!dev->trx[i].phy_valid) {
+                    continue;
+                }
+
+                req.kind = RF215_REQ_CONFIGURE;
+                req.band = dev->trx[i].band;
+                req.phy = &dev->trx[i].phy;
+                break;
+            }
+            default:
+                /* Nothing left: the sequence completes from the stage that got here. */
+                return;
+        }
+
+        start_request(dev, &req, true);
+        return;
+    }
+}
+
+static void recovery_end(struct rf215_dev* dev, int status, struct rf215_event* out_evt) {
+    const struct rf215_event evt = {
+        .kind = (status == RF215_OK) ? RF215_EVT_RECOVERED : RF215_EVT_ERROR,
+        .op = RF215_REQ_RECOVER,
+        .band = dev->recovery.band,
+        .status = status,
+    };
+
+    dev->recovery.active = false;
+    dev->recovery.stage = RECOVERY_STAGE_IDLE;
+    dev->faults = 0u;
+    *out_evt = evt;
+}
+
+static void count_fault(struct rf215_dev* dev) {
+    if (dev->recovery.active) {
+        return;
+    }
+
+    dev->faults++;
+
+    if (dev->faults >= RF215_FAULT_LIMIT) {
+        dev->faults = 0u;
+        dev->recovery_due = true;
+    }
+}
+
+static void track_event(struct rf215_dev* dev, const struct rf215_op* op) {
+    switch (op->evt.kind) {
+        case RF215_EVT_ERROR:
+            /* Only timeouts count towards a reset: a refused request or a bus
+             * error says nothing about the chip. */
+            if (op->evt.status == RF215_ERR_TIMEOUT) {
+                count_fault(dev);
+            }
+            break;
+
+        case RF215_EVT_CONFIGURED:
+            dev->trx[op->band].phy = op->phy_copy;
+            dev->trx[op->band].phy_valid = true;
+            dev->faults = 0u;
+            break;
+
+        case RF215_EVT_READY:
+        case RF215_EVT_RX_ARMED:
+        case RF215_EVT_TX_DONE:
+        case RF215_EVT_RX_FRAME:
+            dev->faults = 0u;
+            break;
+
+        default:
+            break;
+    }
 }
 
 /* Starts the read-out of a frame that arrived while the slot was idle, before
@@ -536,15 +889,19 @@ static void op_fail(struct rf215_dev* dev, int status) {
 /* Distributes the four status bytes over the two transceivers. Bits are ORed
  * in and cleared only by the step that claims them. */
 static void absorb_irqs(struct rf215_dev* dev) {
-    dev->trx[0].radio.irqs |= dev->irq_buf[0] & RF215_RADIO_IRQ_MASK;
-    dev->trx[1].radio.irqs |= dev->irq_buf[1] & RF215_RADIO_IRQ_MASK;
-    dev->trx[0].baseband.irqs |= dev->irq_buf[2] & RF215_BASEBAND_IRQ_USED;
-    dev->trx[1].baseband.irqs |= dev->irq_buf[3] & RF215_BASEBAND_IRQ_USED;
-
     /* Counted here, not where claimed, so a start with no end (a decode
      * failure) shows in the stats. */
     for (uint8_t i = 0u; i < RF215_TRX_COUNT; ++i) {
         const uint8_t bb = dev->irq_buf[2u + i];
+
+        /* In mask mode the status registers report masked interrupts too:
+         * nothing claims the bits of a transceiver that is not enabled. */
+        if (!dev->trx[i].enabled) {
+            continue;
+        }
+
+        dev->trx[i].radio.irqs |= dev->irq_buf[i] & RF215_RADIO_IRQ_MASK;
+        dev->trx[i].baseband.irqs |= bb & RF215_BASEBAND_IRQ_USED;
 
         if ((bb & RF215_BASEBAND_IRQ_RXFS) != 0u) {
             dev->stats.rx_starts++;
@@ -604,8 +961,10 @@ static enum rf215_step_result step_one(struct rf215_dev* dev,
                                        struct rf215_event* out_evt) {
     struct rf215_op* op = &dev->op[index];
 
+    /* A frame the chip holds comes first, or the next one overwrites it; then
+     * whatever waits for the slot; then a receiver that fell off air. */
     if (op->next == NULL) {
-        if (!start_pending_receive(dev, index)) {
+        if (!start_pending_receive(dev, index) && !start_waiting_work(dev, index)) {
             const rf215_micros_t retry = rearm_receive(dev, index);
 
             if (op->next == NULL) {
@@ -650,6 +1009,41 @@ static enum rf215_step_result step_one(struct rf215_dev* dev,
         }
 
         case RF215_STEP_EVENT:
+            track_event(dev, op);
+
+            /* A transmit that gave way to a read-out goes back to the queue; the
+             * read-out starts from the now free slot. */
+            if (op->evt.kind == RF215_EVT_TX_DEFERRED) {
+                op->evt.kind = RF215_EVT_NONE;
+                dev->tx[index].data = op->tx_data;
+                dev->tx[index].len = op->len;
+
+                return step_one(dev, index, out_xfer, out_delay, out_evt);
+            }
+
+            /* A recovery stage advances the sequence instead of reaching the host. */
+            if (op->recovery_stage) {
+                const int status = op->evt.status;
+
+                op->evt.kind = RF215_EVT_NONE;
+
+                if (status != RF215_OK) {
+                    recovery_end(dev, status, out_evt);
+                    dev->stats.events++;
+                    break;
+                }
+
+                recovery_next_stage(dev);
+
+                if (dev->op[dev->recovery.band].next == NULL) {
+                    recovery_end(dev, RF215_OK, out_evt);
+                    dev->stats.events++;
+                    break;
+                }
+
+                return step_one(dev, index, out_xfer, out_delay, out_evt);
+            }
+
             *out_evt = op->evt;
             op->evt.kind = RF215_EVT_NONE;
             dev->stats.events++;

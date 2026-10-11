@@ -37,7 +37,7 @@
 #define CCA_TIMEOUT_US (20000u)
 
 /* Appended by the chip, but counted in the length written to TXFL. */
-#define FCS_LEN (2u)
+#define FCS_LEN (RF215_FCS_LEN)
 
 /* Capacity of a frame buffer, in octets, check sequence included. */
 #define RF215_FRAME_MAX (2047u)
@@ -81,7 +81,7 @@ tx_finish(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer* out) {
 
     if (op->evt.kind == RF215_EVT_NONE) {
         /* A received frame is waiting and the next one overwrites it: the read-out needs
-         * the operation slot, so the transmit is deferred and the host submits it again. */
+         * the operation slot, so the transmit goes back to the queue behind it. */
         if ((trx->baseband.irqs & RF215_BASEBAND_IRQ_RXFE) != 0u) {
             return rf215_emit(op, RF215_EVT_TX_DEFERRED, RF215_OK, NULL);
         }
@@ -720,7 +720,7 @@ rf215_op_tx_start(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer*
  *        tx_finish
  *            |
  *            +-- an event is staged ----------------------> TX_DONE, TX_BUSY or ERROR
- *            +-- a received frame waits to be read out ---> TX_DEFERRED
+ *            +-- a received frame waits to be read out ---> TX_DEFERRED (back to the queue)
  *            +-- neither: back off ------------------------> tx_begin_attempt
  */
 

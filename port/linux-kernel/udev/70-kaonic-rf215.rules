@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Stable names for the Kaonic 1S radio interfaces.
+#
+# The driver lets the kernel number its interfaces (rf0, rf1, ...), which
+# depends on probe order. These rules name each one after the SPI device its
+# chip sits on and the band it serves, which do not: the chip on spi3 is "a",
+# the chip on spi6 is "b"; dev_port is 0 for the sub-GHz transceiver and 1 for
+# the 2.4 GHz one. Install to /etc/udev/rules.d/ and adjust the bus
+# numbers for another board.
+
+# Only the raw interfaces (rfN) are named; DRIVERS and KERNELS both match the
+# parent SPI device. A negated DRIVERS guard would stop at the interface itself,
+# which has no driver, and skip every rule.
+SUBSYSTEM!="net", GOTO="kaonic_rf215_end"
+ACTION!="add", GOTO="kaonic_rf215_end"
+KERNEL!="rf[0-9]*", GOTO="kaonic_rf215_end"
+
+KERNELS=="spi3.0", DRIVERS=="kaonic_rf215", ATTR{dev_port}=="0", NAME="rf09_a"
+KERNELS=="spi3.0", DRIVERS=="kaonic_rf215", ATTR{dev_port}=="1", NAME="rf24_a"
+KERNELS=="spi6.0", DRIVERS=="kaonic_rf215", ATTR{dev_port}=="0", NAME="rf09_b"
+KERNELS=="spi6.0", DRIVERS=="kaonic_rf215", ATTR{dev_port}=="1", NAME="rf24_b"
+
+LABEL="kaonic_rf215_end"

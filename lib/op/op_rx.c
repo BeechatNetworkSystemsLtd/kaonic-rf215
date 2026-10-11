@@ -90,14 +90,18 @@ rx_stopped(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer* out) {
 /* Hands the frame up, or ends quietly when there is nothing to report. */
 static enum rf215_step_result
 rx_report(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer* out) {
-    (void)dev;
+    /* The baseband verified the FCS; with it off the last two bytes are payload. */
+    const uint16_t fcs = dev->trx[op->band].baseband.fcs ? RF215_FCS_LEN : 0u;
+
     (void)out;
 
-    /* Nothing to report: the frame was dropped or never read. */
-    if (op->len == 0u) {
+    /* Nothing to report: the frame was dropped, never read, or has no payload. */
+    if (op->len <= fcs) {
         op->next = NULL;
         return RF215_STEP_IDLE;
     }
+
+    op->len = (uint16_t)(op->len - fcs);
 
     /* rf215_emit leaves len and rssi alone, so both survive the staging. */
     op->evt.len = op->len;

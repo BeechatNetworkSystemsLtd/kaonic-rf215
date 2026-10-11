@@ -60,6 +60,11 @@ reset_ready(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer* out) 
     return rf215_emit(op, RF215_EVT_READY, RF215_OK, NULL);
 }
 
+/* The interrupts to arm on a transceiver: none on one that is not enabled. */
+static uint8_t irq_mask(const struct rf215_trx* trx, uint8_t used) {
+    return trx->enabled ? used : 0u;
+}
+
 /* Reads all four IRQS registers; the chip holds its interrupt pin until each is read. */
 static enum rf215_step_result
 reset_clear_irqs(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer* out) {
@@ -74,7 +79,7 @@ reset_irqm_bb24(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer* o
     return rf215_write8(op,
                         out,
                         rf215_baseband_reg(&dev->trx[1], RF215_RG_BBCX_IRQM),
-                        RF215_BASEBAND_IRQ_USED,
+                        irq_mask(&dev->trx[1], RF215_BASEBAND_IRQ_USED),
                         reset_clear_irqs);
 }
 
@@ -84,7 +89,7 @@ reset_irqm_bb09(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer* o
     return rf215_write8(op,
                         out,
                         rf215_baseband_reg(&dev->trx[0], RF215_RG_BBCX_IRQM),
-                        RF215_BASEBAND_IRQ_USED,
+                        irq_mask(&dev->trx[0], RF215_BASEBAND_IRQ_USED),
                         reset_irqm_bb24);
 }
 
@@ -94,7 +99,7 @@ reset_irqm_radio24(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer
     return rf215_write8(op,
                         out,
                         rf215_radio_reg(&dev->trx[1], RF215_RG_RFXX_IRQM),
-                        RF215_RADIO_IRQ_USED,
+                        irq_mask(&dev->trx[1], RF215_RADIO_IRQ_USED),
                         reset_irqm_bb09);
 }
 
@@ -104,7 +109,7 @@ reset_irqm_radio09(struct rf215_dev* dev, struct rf215_op* op, struct rf215_xfer
     return rf215_write8(op,
                         out,
                         rf215_radio_reg(&dev->trx[0], RF215_RG_RFXX_IRQM),
-                        RF215_RADIO_IRQ_USED,
+                        irq_mask(&dev->trx[0], RF215_RADIO_IRQ_USED),
                         reset_irqm_radio24);
 }
 
