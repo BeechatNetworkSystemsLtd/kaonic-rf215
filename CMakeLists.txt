@@ -2,7 +2,15 @@
 
 cmake_minimum_required(VERSION 3.16)
 
-project(kaonic-rf215 VERSION 0.1.0 LANGUAGES C)
+# The version is kept in the header, which the Kbuild port sees as well.
+file(
+    STRINGS include/rf215/rf215_version.h RF215_VERSION_DEFINES
+    REGEX "^#define RF215_VERSION_(MAJOR|MINOR|PATCH) [0-9]+$"
+)
+string(REGEX REPLACE ".*MAJOR ([0-9]+).*MINOR ([0-9]+).*PATCH ([0-9]+).*" "\\1.\\2.\\3"
+                     RF215_VERSION "${RF215_VERSION_DEFINES}")
+
+project(kaonic-rf215 VERSION ${RF215_VERSION} LANGUAGES C)
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(RF215_IS_TOP_LEVEL ON)

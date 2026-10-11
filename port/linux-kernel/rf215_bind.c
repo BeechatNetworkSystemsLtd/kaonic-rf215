@@ -449,7 +449,8 @@ static int rf215_probe(struct spi_device* spi) {
     rf215_debugfs_init(rf);
 
     dev_info(&spi->dev,
-             "AT86RF215 part 0x%02x version 0x%02x, %u of %u transceivers\n",
+             "driver " RF215_VERSION_STRING
+             ", AT86RF215 part 0x%02x version 0x%02x, %u of %u transceivers\n",
              rf->core.part_number,
              rf->core.version,
              attached,
@@ -494,4 +495,5 @@ MODULE_DEVICE_TABLE(spi, rf215_spi_ids);
 module_spi_driver(rf215_driver);
 MODULE_DESCRIPTION("Microchip AT86RF215 sub-GHz / 2.4 GHz transceiver");
 MODULE_AUTHOR("Beechat Network Systems Ltd.");
+MODULE_VERSION(RF215_VERSION_STRING);
 MODULE_LICENSE("GPL");
